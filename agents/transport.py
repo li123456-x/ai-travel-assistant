@@ -1,9 +1,40 @@
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from config.model import model
 from database.repository import record_execution_step_safe
 from tools.intercity_transport import search_intercity_transport
-from tools.transport import resolve_locations,search_transport_route_by_coords
+from tools.transport import resolve_locations, search_transport_route_by_coords
+
+
+def _validate_route_result(result, mode: str) -> None:
+    """工具可能返回错误字符串或成功但无路线的数据；两者都不能交给模型补全。"""
+    if _looks_like_route_error(result):
+        raise ValueError(result)
+    try:
+        data = json.loads(result) if isinstance(result, str) else result
+    except (TypeError, json.JSONDecodeError) as e:
+        raise ValueError("高德路线结果不是有效 JSON") from e
+    if not isinstance(data, dict) or str(data.get("status")) != "1":
+        raise ValueError("高德路线查询未成功返回")
+    route = data.get("route")
+    route_key = "transits" if mode == "transit" else "paths"
+    paths = route.get(route_key) if isinstance(route, dict) else None
+    if (
+        not isinstance(paths, list)
+        or not paths
+        or any(not isinstance(path, dict) or not path for path in paths)
+    ):
+        raise ValueError(
+            f"高德没有可用的 {mode} 路线，请调整景点或交通方式"
+        )
+
+
+def _validate_intercity_result(result) -> None:
+    if not isinstance(result, str) or not result.strip():
+        raise ValueError("城际交通查询结果为空")
+    if result.strip().startswith(("暂未查询到", "城际交通查询失败")):
+        raise ValueError(result)
 
 
 def _looks_like_route_error(
@@ -90,6 +121,23 @@ def transport_node(state):
         "attraction_names",
         [],
     )
+    city_mode = state.get("city_transport_mode", "transit")
+    intercity_mode = state.get("intercity_transport_mode", "train")
+    if city_mode not in {"transit", "driving", "walking"}:
+        raise ValueError("不支持的市内交通方式")
+    if intercity_mode not in {"train", "flight"}:
+        raise ValueError("不支持的城际交通方式")
+    if not isinstance(hotel_name, str) or not hotel_name.strip():
+        raise ValueError("交通规划缺少有效酒店名称，请先重新选择酒店")
+    if (
+        not isinstance(attraction_names, list)
+        or not attraction_names
+        or any(not isinstance(name, str) or not name.strip()
+               for name in attraction_names)
+    ):
+        raise ValueError("交通规划缺少有效景点列表，请先重新选择景点")
+    hotel_name = hotel_name.strip()
+    attraction_names = [name.strip() for name in attraction_names]
     print(
         "[Transport] hotel_name =",
         hotel_name,
@@ -110,6 +158,7 @@ def transport_node(state):
                     "origin": origin,
                     "destination": destination,
                     "date": departure_date,
+                    "transport_mode": intercity_mode,
                 },
             )
             return_future = executor.submit(
@@ -118,6 +167,7 @@ def transport_node(state):
                     "origin": destination,
                     "destination": origin,
                     "date": return_date,
+                    "transport_mode": intercity_mode,
                 },
             )
             outbound_result = (
@@ -126,6 +176,8 @@ def transport_node(state):
             return_result = (
                 return_future.result()
             )
+        _validate_intercity_result(outbound_result)
+        _validate_intercity_result(return_result)
         intercity_duration = (
             time.time()- intercity_start
         )
@@ -172,12 +224,32 @@ def transport_node(state):
                 end_place,
             ]
         )
-    locations, geocoding_errors = (
-        resolve_locations(
+    try:
+        locations, geocoding_errors = resolve_locations(
             places=places,
             city=destination,
         )
-    )
+        # 即使工具没有明确报告错误，也要保证所有端点都具备查询所需数据。
+        geocoding_errors = dict(geocoding_errors)
+        for place in dict.fromkeys(places):
+            info = locations.get(place)
+            if (
+                not isinstance(info, dict)
+                or not isinstance(info.get("location"), str)
+                or not info["location"].strip()
+                or not str(info.get("citycode") or "").strip()
+            ):
+                geocoding_errors.setdefault(place, "地点缺少有效坐标或 citycode")
+    except Exception as e:
+        record_execution_step_safe(
+            agent_run_id=agent_run_id,
+            step_type="tool",
+            step_name="amap_geocoding",
+            duration=time.time() - geocoding_start,
+            success=False,
+            error_message=str(e),
+        )
+        raise
     geocoding_duration = (
         time.time()
         - geocoding_start
@@ -202,6 +274,11 @@ def transport_node(state):
         "[Transport] 高德地点解析耗时："
         f"{geocoding_duration:.2f}s"
     )
+    if geocoding_errors:
+        raise ValueError(
+            "市内交通无法规划："
+            + "; ".join(f"{place}：{error}" for place, error in geocoding_errors.items())
+        )
     city_route_start = time.time()
     city_route_success = True
     city_route_errors = []
@@ -271,7 +348,7 @@ def transport_node(state):
                             start_info["citycode"],
                         "destination_citycode":
                             end_info["citycode"],
-                        "mode": "transit",
+                        "mode": city_mode,
                     },
                 )
                 future_map[future] = (
@@ -292,17 +369,7 @@ def transport_node(state):
                     route_result = (
                         future.result()
                     )
-                    if _looks_like_route_error(
-                        route_result
-                    ):
-                        city_route_success = (
-                            False
-                        )
-                        city_route_errors.append(
-                            f"{start_place} → "
-                            f"{end_place}："
-                            f"{route_result}"
-                        )
+                    _validate_route_result(route_result, city_mode)
                 except Exception as e:
                     city_route_success = False
                     error_text = (
@@ -354,6 +421,11 @@ def transport_node(state):
         "[Transport] 高德市内路线查询耗时："
         f"{city_route_duration:.2f}s"
     )
+    if not city_route_success or not route_tasks:
+        raise ValueError(
+            "市内路线查询未完成，不能生成可靠交通方案："
+            + "; ".join(city_route_errors)
+        )
 
     prompt = f"""
     你是一名专业的旅游交通规划 Agent。
@@ -370,6 +442,10 @@ def transport_node(state):
     人数：{state["people"]}
     总预算：{state["budget"]}
     用户限制：{state["constraints"]}
+    ================ 最新交通要求 ================
+    {state.get("transport_revision_request", "")}
+    市内方式：{city_mode}（transit=公共交通，driving=自驾，walking=步行）
+    去程及返程方式：{intercity_mode}（train=铁路，flight=飞机）
     ================ 酒店 ================
     {hotel_name}
     ================ 景点 ================
@@ -392,7 +468,7 @@ def transport_node(state):
     - 推荐交通方式
     - 预计耗时
     - 距离或换乘信息
-    - 是否适合步行/公交/地铁/出租车
+    - 按当前查询的交通方式解释，不得自行换成未查询的方式
     
     三、返程城际交通
     - 推荐返程时间和交通方式
@@ -406,6 +482,8 @@ def transport_node(state):
     4. 不得虚构实时票价和余票。
     5. 考虑用户限制，尽量减少明显往返和过度疲劳。
     6. 不要重复介绍景点和酒店，输出尽量简洁。
+    7. 必须遵守当前指定的市内及城际交通方式；证据不足时说明限制，不得用旧方案或其他方式替代。
+    8. Tavily 是参考信息检索，不是实时票务接口；不要声称已验证库存或预订成功。
     
     最后注明：
     实际班次、票价、余票及临时调整以官方渠道为准。
@@ -416,6 +494,8 @@ def transport_node(state):
         result = model.invoke(
             prompt
         )
+        if not isinstance(result.content, str) or not result.content.strip():
+            raise ValueError("交通模型返回了空说明")
         llm_duration = (
             time.time()- llm_start
         )

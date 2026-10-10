@@ -20,13 +20,21 @@ def search_intercity_transport(
     origin: str,
     destination: str,
     date: str,
+    transport_mode: str = "train",
 ) -> str:
     """
-    查询两个城市之间的高铁、动车、火车等城际交通信息。
+    按 train（铁路）或 flight（飞机）检索城际交通参考信息，不提供实时库存或订票。
     """
+    keywords = {
+        "train": "高铁 动车 火车 车次 出发时间 到达时间 参考票价",
+        "flight": "飞机 航班 机场 起飞时间 到达时间 参考票价",
+    }
+    if transport_mode not in keywords:
+        raise ValueError("不支持的城际交通方式，只支持 train 或 flight")
+
     query = (
         f"{date} {origin} 到 {destination} "
-        "高铁 动车 火车 车次 出发时间 到达时间 票价"
+        f"{keywords[transport_mode]}"
     )
 
     result = _get_tavily_client().search(
@@ -35,8 +43,19 @@ def search_intercity_transport(
     )
 
     results = result.get("results", [])
+    if not isinstance(results, list):
+        raise ValueError("城际交通查询返回格式错误")
+    results = [
+        item for item in results
+        if isinstance(item, dict)
+        and (str(item.get("title") or "").strip()
+             or str(item.get("content") or "").strip())
+    ]
     if not results:
-        return f"暂未查询到 {date} {origin} 到 {destination} 的城际交通信息。"
+        raise ValueError(
+            f"暂未查询到 {date} {origin} 到 {destination} 的"
+            f"{transport_mode} 交通参考信息，请调整日期或交通方式。"
+        )
 
     text_list = []
     for index, item in enumerate(results, start=1):

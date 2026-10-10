@@ -9,52 +9,40 @@ from agents.transport import transport_node
 from config.human_reviewer import human_review_node
 from config.route import route_human_review, route_reviewer, route_supervisor
 from config.state import TravelState
+from config.revision import validate_node_update
 from harness.runtime import run_with_harness
 
 
-def attraction_harness_node(state):
+def _run_checked_agent(agent_name, agent_func, state):
+    def checked_agent(agent_state):
+        return validate_node_update(agent_name, agent_func(agent_state))
+
     return run_with_harness(
-        agent_name="attraction",
-        agent_func=attraction_node,
+        agent_name=agent_name,
+        agent_func=checked_agent,
         state=state,
         max_retries=1,
     )
+
+
+def attraction_harness_node(state):
+    return _run_checked_agent("attraction", attraction_node, state)
 
 
 def hotel_harness_node(state):
-    return run_with_harness(
-        agent_name="hotel",
-        agent_func=hotel_node,
-        state=state,
-        max_retries=1,
-    )
+    return _run_checked_agent("hotel", hotel_node, state)
 
 
 def transport_harness_node(state):
-    return run_with_harness(
-        agent_name="transport",
-        agent_func=transport_node,
-        state=state,
-        max_retries=1,
-    )
+    return _run_checked_agent("transport", transport_node, state)
 
 
 def planner_harness_node(state):
-    return run_with_harness(
-        agent_name="planner",
-        agent_func=planner_node,
-        state=state,
-        max_retries=1,
-    )
+    return _run_checked_agent("planner", planner_node, state)
 
 
 def reviewer_harness_node(state):
-    return run_with_harness(
-        agent_name="reviewer",
-        agent_func=reviewer_node,
-        state=state,
-        max_retries=1,
-    )
+    return _run_checked_agent("reviewer", reviewer_node, state)
 
 
 builder = StateGraph(TravelState)
@@ -100,6 +88,6 @@ builder.add_conditional_edges(
     route_human_review,
     {
         "approve": END,
-        "reject": "planner",
+        "reject": "supervisor",
     },
 )

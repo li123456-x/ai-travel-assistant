@@ -2,6 +2,7 @@ import time
 from pydantic import BaseModel, Field
 from config.model import model
 from config.state import TravelState
+from config.revision import build_revision_context
 from database.repository import record_execution_step_safe
 
 class ReviewDecision(BaseModel):
@@ -9,6 +10,7 @@ class ReviewDecision(BaseModel):
         description="旅游方案是否通过审核"
     )
     review_result: str = Field(
+        min_length=1,
         description="简洁指出方案关键问题和必要修改建议"
     )
 
@@ -28,6 +30,13 @@ def reviewer_node(state: TravelState):
     预算：{state["budget"]}
     用户偏好：{state["preferences"]}
     用户限制：{state["constraints"]}
+    ================ 已确认的修改要求 ================
+    {build_revision_context(state)}
+    ================ 最新节点结果 ================
+    当前景点：{state.get("attraction_names", [])}
+    当前选中酒店：{state.get("hotel_name", "")}
+    酒店推荐依据：{state.get("hotel_result", "")}
+    最新交通依据：{state.get("transport_result", "")}
     ================ 当前旅游方案 ================
     {state["planner_result"]}
     ================ 审核要求 ================
@@ -46,6 +55,8 @@ def reviewer_node(state: TravelState):
     12. 去返程时间是否合理
     13. 市内交通是否与高德结果明显冲突
     14. 返程安排是否预留足够到站时间
+    15. 是否错误恢复了排除的景点或酒店
+    16. 住宿酒店是否与当前选中酒店一致，是否使用最新交通方式及路线
     只检查影响方案实际可执行性的关键问题。
     如果没有重大问题，直接通过。
     审核结果控制在 300 字以内，不要重复完整旅游方案。
@@ -53,6 +64,8 @@ def reviewer_node(state: TravelState):
     llm_start = time.time()
     try:
         decision = reviewer_model.invoke(prompt)
+        if not decision.review_result.strip():
+            raise ValueError("AI 审核意见为空")
         llm_duration = time.time() - llm_start
         record_execution_step_safe(
             agent_run_id=agent_run_id,

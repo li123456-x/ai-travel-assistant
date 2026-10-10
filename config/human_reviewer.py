@@ -1,6 +1,7 @@
 from langgraph.types import interrupt
 
 from config.state import TravelState
+from config.revision import build_revision_update
 
 
 def human_review_node(state: TravelState):
@@ -22,21 +23,4 @@ def human_review_node(state: TravelState):
     print("\n========== 收到人工审核结果 ==========")
     print(human_decision)
 
-    approved = bool(human_decision["approved"])
-    comment = human_decision.get("comment", "")
-
-    result = {
-        "human_review_passed": approved,
-        "human_review_result": comment,
-    }
-
-    if approved:
-        result["trigger_reason"] = "human_review_pass"
-        return result
-
-    result["trigger_reason"] = "human_review_reject"
-    result["human_revision_count"] = (
-        state.get("human_revision_count", 0) + 1
-    )
-
-    return result
+    return build_revision_update(state, human_decision)

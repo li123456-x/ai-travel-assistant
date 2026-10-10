@@ -1,5 +1,7 @@
 from datetime import datetime
 
+from sqlalchemy import or_
+
 from config.database import get_db
 from database.models import (
     AIReview,
@@ -76,6 +78,39 @@ def create_travel_plan(session_id: int, state: dict, version: int):
         db.add(plan)
         _commit_refresh(db, plan)
         return plan.id
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def create_plan_with_review(session_id: int, state: dict, version: int) -> int:
+    """一个事务保存完整方案及其 AI 审核，避免只保存方案的半完成版本。"""
+    db = get_db()
+    try:
+        plan = TravelPlan(
+            session_id=session_id,
+            version=version,
+            attractions_result=state.get("attractions_result", ""),
+            hotel_result=state.get("hotel_result", ""),
+            transport_result=state.get("transport_result", ""),
+            planner_result=state.get("planner_result", ""),
+            is_final=False,
+        )
+        db.add(plan)
+        # flush 获得主键，但尚未提交；后面的审核写入失败时方案也能回滚。
+        db.flush()
+        plan_id = plan.id
+        db.add(
+            AIReview(
+                plan_id=plan_id,
+                review_passed=state.get("review_passed", False),
+                review_result=state.get("review_result", ""),
+            )
+        )
+        db.commit()
+        return plan_id
     except Exception:
         db.rollback()
         raise
@@ -240,6 +275,33 @@ def record_execution_step_safe(
         db.rollback()
         print(f"[Harness] Step 日志写入失败：{step_name}，错误：{e}")
         return None
+    finally:
+        db.close()
+
+
+def get_travel_sessions(search: str = ""):
+    db = get_db()
+    try:
+        query = db.query(TravelSession).filter(TravelSession.plans.any())
+        search = search.strip()
+        if search:
+            query = query.filter(or_(
+                TravelSession.origin.contains(search, autoescape=True),
+                TravelSession.destination.contains(search, autoescape=True),
+                TravelSession.user_request.contains(search, autoescape=True),
+            ))
+        sessions = query.order_by(
+            TravelSession.created_at.desc(), TravelSession.id.desc()
+        ).all()
+        return [{
+            "session_id": item.id,
+            "origin": item.origin,
+            "destination": item.destination,
+            "departure_date": item.departure_date,
+            "return_date": item.return_date,
+            "status": item.status,
+            "created_at": item.created_at,
+        } for item in sessions]
     finally:
         db.close()
 

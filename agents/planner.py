@@ -1,23 +1,19 @@
 import time
 from config.model import model
 from config.state import TravelState
+from config.revision import build_revision_context
 from database.repository import record_execution_step_safe
 
 def _build_revision_instruction(state: TravelState) -> str:
-    trigger_reason = state.get("trigger_reason", "initial")
-    if trigger_reason == "human_review_reject":
-        return f"""
-    本次是人工审核打回。
-    必须优先根据下面的人工审核意见修改当前方案：
-    {state.get("human_review_result", "")}
-"""
-    if trigger_reason == "ai_review_reject":
-        return f"""
-    本次是 AI Reviewer 审核打回。
-    必须根据下面的 AI 审核意见修正当前方案：
-    {state.get("review_result", "")}
-"""
-    return "本次是首次生成或正常生成，请根据用户需求制定完整方案。"
+    instructions = [
+        "以当前最新景点、酒店和交通结果为准；旧行程仅供参考。",
+        "住宿必须使用当前 hotel_name 指定的酒店完整名称，不得自行替换。",
+        "不得安排排除名单中的景点，交通方式必须遵循当前实际查询结果。",
+        build_revision_context(state),
+    ]
+    if state.get("trigger_reason") == "ai_review_reject":
+        instructions.append("同时修正以下 AI 审核问题：\n" + state.get("review_result", ""))
+    return "\n".join(instructions)
 
 def planner_node(state: TravelState):
     total_start = time.time()
@@ -70,6 +66,8 @@ def planner_node(state: TravelState):
     llm_start = time.time()
     try:
         result = model.invoke(prompt)
+        if not isinstance(result.content, str) or not result.content.strip():
+            raise ValueError("行程生成结果为空")
         llm_duration = time.time() - llm_start
         record_execution_step_safe(
             agent_run_id=agent_run_id,
