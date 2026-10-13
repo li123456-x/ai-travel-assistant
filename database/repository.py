@@ -1,14 +1,18 @@
 from datetime import datetime
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 
 from config.database import get_db
+from config.memory import (
+    build_memory_payload, build_memory_record, confirmation_signature, memory_signature,
+)
 from database.models import (
     AIReview,
     AgentRun,
     ExecutionStep,
     HumanReview,
     TravelPlan,
+    TravelPlanMemory,
     TravelSession,
 )
 
@@ -76,6 +80,8 @@ def create_travel_plan(session_id: int, state: dict, version: int):
             is_final=False,
         )
         db.add(plan)
+        db.flush()
+        _add_plan_memory(db, plan.id, state)
         _commit_refresh(db, plan)
         return plan.id
     except Exception:
@@ -109,11 +115,142 @@ def create_plan_with_review(session_id: int, state: dict, version: int) -> int:
                 review_result=state.get("review_result", ""),
             )
         )
+        _add_plan_memory(db, plan_id, state)
         db.commit()
         return plan_id
     except Exception:
         db.rollback()
         raise
+    finally:
+        db.close()
+
+
+def _add_plan_memory(db, plan_id: int, state: dict) -> TravelPlanMemory | None:
+    record = build_memory_record(state)
+    if record is None:
+        return
+    snapshot = {
+        "days": state.get("days", record["request_payload"]["days"]),
+        "needs_hotel": state.get("days", record["request_payload"]["days"]) > 1,
+        "hotel_name": state.get("hotel_name", ""),
+        "attraction_names": state.get("attraction_names", []),
+        "transport_segments": state.get("transport_segments", []),
+        "effective_request_payload": build_memory_payload(state),
+        "human_feedback_history": state.get("human_feedback_history", []),
+        "revision_requests": {
+            scope: state.get(f"{scope}_revision_request", "")
+            for scope in ("attraction", "hotel", "transport", "planner")
+        },
+        "attraction_excluded_names": state.get("attraction_excluded_names", []),
+        "hotel_excluded_names": state.get("hotel_excluded_names", []),
+        "hotel_search_keyword": state.get("hotel_search_keyword", "酒店"),
+    }
+    memory = TravelPlanMemory(plan_id=plan_id, result_snapshot=snapshot, **record)
+    db.add(memory)
+    return memory
+
+
+def save_confirmed_plan(session_id: int, state: dict, comment: str) -> dict:
+    """Persist one human-confirmed result atomically; retries do not add versions."""
+    if state.get("human_review_passed") is not True or state.get("__interrupt__"):
+        raise ValueError("只有已完成人工确认的方案才能保存")
+    if not isinstance(state.get("planner_result"), str) or not state["planner_result"].strip():
+        raise ValueError("最终方案内容不能为空")
+    token = confirmation_signature(state)
+    db = get_db()
+    try:
+        session = (
+            db.query(TravelSession).filter(TravelSession.id == session_id)
+            .with_for_update().one_or_none()
+        )
+        if session is None or state.get("thread_id") != session.thread_id:
+            raise ValueError("旅行任务不存在或不属于当前工作流")
+        final = (
+            db.query(TravelPlan).filter_by(session_id=session_id, is_final=True)
+            .order_by(TravelPlan.id.desc()).first()
+        )
+        if final and final.memory and final.memory.result_snapshot.get("confirmation_signature") == token:
+            latest = db.query(HumanReview).filter_by(plan_id=final.id).order_by(HumanReview.id.desc()).first()
+            if session.status == "completed" and latest and latest.approved:
+                return {"plan_id": final.id, "version": final.version}
+        if session.status == "completed":
+            raise ValueError("该任务已完成，请创建新任务，不重复写入最终版本")
+        version = (db.query(func.max(TravelPlan.version)).filter_by(session_id=session_id).scalar() or 0) + 1
+        db.query(TravelPlan).filter_by(session_id=session_id).update(
+            {"is_final": False}, synchronize_session=False,
+        )
+        plan = TravelPlan(
+            session_id=session_id, version=version, is_final=True,
+            **{key: state.get(key, "") for key in (
+                "attractions_result", "hotel_result", "transport_result", "planner_result",
+            )},
+        )
+        db.add(plan)
+        db.flush()
+        plan_id = plan.id
+        db.add(AIReview(
+            plan_id=plan_id, review_passed=state.get("review_passed", False),
+            review_result=state.get("review_result", ""),
+        ))
+        db.add(HumanReview(plan_id=plan_id, approved=True, comment=comment))
+        memory = _add_plan_memory(db, plan_id, state)
+        memory.result_snapshot = {**memory.result_snapshot, "confirmation_signature": token}
+        session.status = "completed"
+        db.commit()
+        return {"plan_id": plan_id, "version": version}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def find_reusable_plan(state: dict) -> dict | None:
+    payload = build_memory_payload(state)
+    signature = memory_signature(payload)
+    db = get_db()
+    try:
+        latest_human_review = (
+            db.query(func.max(HumanReview.id))
+            .filter(HumanReview.plan_id == TravelPlan.id)
+            .correlate(TravelPlan).scalar_subquery()
+        )
+        rows = (
+            db.query(TravelPlanMemory, TravelPlan, TravelSession, HumanReview)
+            .join(TravelPlan, TravelPlanMemory.plan_id == TravelPlan.id)
+            .join(TravelSession, TravelPlan.session_id == TravelSession.id)
+            .join(HumanReview, HumanReview.plan_id == TravelPlan.id)
+            .filter(
+                TravelPlanMemory.request_signature == signature,
+                TravelPlan.is_final.is_(True),
+                TravelSession.status == "completed",
+                HumanReview.id == latest_human_review,
+                HumanReview.approved.is_(True),
+            )
+            .order_by(TravelPlan.created_at.desc(), TravelPlan.id.desc())
+        )
+        for memory, plan, session, human_review in rows:
+            if memory.request_payload != payload or not plan.planner_result.strip():
+                continue
+            latest_ai = (
+                db.query(AIReview).filter(AIReview.plan_id == plan.id)
+                .order_by(AIReview.id.desc()).first()
+            )
+            result = {
+                **memory.result_snapshot,
+                "attractions_result": plan.attractions_result or "",
+                "hotel_result": plan.hotel_result or "",
+                "transport_result": plan.transport_result or "",
+                "planner_result": plan.planner_result,
+                "review_passed": latest_ai.review_passed if latest_ai else False,
+                "review_result": latest_ai.review_result if latest_ai else "",
+            }
+            return {
+                "session_id": session.id, "plan_id": plan.id, "version": plan.version,
+                "created_at": plan.created_at, "request_payload": payload,
+                "human_comment": human_review.comment or "", "result": result,
+            }
+        return None
     finally:
         db.close()
 

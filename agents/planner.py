@@ -2,12 +2,17 @@ import time
 from config.model import model
 from config.state import TravelState
 from config.revision import build_revision_context
+from config.trip_policy import requires_hotel
 from database.repository import record_execution_step_safe
 
 def _build_revision_instruction(state: TravelState) -> str:
     instructions = [
         "以当前最新景点、酒店和交通结果为准；旧行程仅供参考。",
-        "住宿必须使用当前 hotel_name 指定的酒店完整名称，不得自行替换。",
+        (
+            "住宿必须使用当前 hotel_name 指定的酒店完整名称，不得自行替换。"
+            if requires_hotel(state)
+            else "本次是一日游，不得安排住宿、推荐酒店或添加酒店往返路线。"
+        ),
         "不得安排排除名单中的景点，交通方式必须遵循当前实际查询结果。",
         build_revision_context(state),
     ]
@@ -55,7 +60,7 @@ def planner_node(state: TravelState):
     2. 每天安排合理数量的景点
     3. 不要安排过于紧凑的行程
     4. 尽量将距离较近的景点安排在同一天
-    5. 合理安排酒店与景点之间的交通
+    5. 多日游按酒店与景点安排交通；一日游只安排去程、景点之间交通和返程，不安排酒店
     6. 考虑用户预算、偏好和限制
     7. 给出每天的大致时间安排和交通方式
     8. 城际交通优先遵循 Transport Agent 的 Tavily 查询结果

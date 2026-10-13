@@ -4,6 +4,9 @@ No model, database, or external API is called from this module.
 """
 
 import unicodedata
+from copy import deepcopy
+
+from config.trip_policy import requires_hotel, skipped_hotel_update, walking_policy
 
 
 REVISION_SCOPES = frozenset({"planner", "attraction", "hotel", "transport"})
@@ -18,7 +21,7 @@ INVALIDATION_RULES = {
 RESULT_FIELDS = {
     "attraction": ("attractions_result", "attraction_names"),
     "hotel": ("hotel_result", "hotel_name"),
-    "transport": ("transport_result",),
+    "transport": ("transport_result", "transport_segments"),
 }
 
 
@@ -66,6 +69,8 @@ def build_revision_update(state: dict, decision: dict) -> dict:
     scope = decision.get("revision_scope", "planner")
     if not isinstance(scope, str) or scope not in REVISION_SCOPES:
         raise ValueError("不支持的修改类型")
+    if scope == "hotel" and not requires_hotel(state):
+        raise ValueError("一日游不查询酒店；请修改景点、交通或行程")
 
     update.update({
         "trigger_reason": "human_review_reject",
@@ -99,22 +104,41 @@ def build_revision_update(state: dict, decision: dict) -> dict:
             if not isinstance(value, str) or value not in choices:
                 raise ValueError(f"不支持的{label}")
             update[key] = value
+        policy_state = {**state, **{
+            key: decision[key]
+            for key in (
+                "allow_walking_fallback", "max_walking_distance_m", "max_walking_duration_s",
+                "max_total_walking_distance_m", "max_total_walking_duration_s",
+            ) if key in decision
+        }}
+        update.update(walking_policy(policy_state))
 
     for node_name in INVALIDATION_RULES[scope]:
         update[f"{node_name}_status"] = "dirty"
         for field in RESULT_FIELDS[node_name]:
-            update[field] = [] if field == "attraction_names" else ""
+            update[field] = [] if field in {"attraction_names", "transport_segments"} else ""
+
+    if not requires_hotel(state):
+        update.update(skipped_hotel_update())
+
+    update["human_feedback_history"] = [
+        *deepcopy(state.get("human_feedback_history", [])),
+        {"revision_scope": scope, "comment": comment},
+    ]
 
     # Keep session/thread identifiers and the previous planner_result unchanged.
     # Existing database versions remain independent of these state updates.
     return update
 
 
-def validate_node_update(agent_name: str, update: dict) -> dict:
+def validate_node_update(agent_name: str, update: dict, *, state: dict | None = None) -> dict:
     """Check structural usability before recording a node as completed."""
     if not isinstance(update, dict):
         raise ValueError(f"{agent_name} 节点必须返回状态字典")
     checked = dict(update)
+    if agent_name == "hotel" and not requires_hotel(state if state is not None else checked):
+        checked.update(skipped_hotel_update())
+        return checked
     result_keys = {
         "attraction": "attractions_result",
         "hotel": "hotel_result",
@@ -150,10 +174,12 @@ def build_revision_context(state: dict) -> str:
         if request:
             lines.append(f"{label}：{request}")
     lines.extend([
+        f"住宿规则：{'需要酒店' if requires_hotel(state) else '一日游，不查询或安排酒店'}",
         f"排除景点：{state.get('attraction_excluded_names', [])}",
         f"酒店查询关键词：{state.get('hotel_search_keyword', '酒店')}",
         f"排除酒店：{state.get('hotel_excluded_names', [])}",
         f"市内交通方式：{state.get('city_transport_mode', 'transit')}",
         f"城际交通方式：{state.get('intercity_transport_mode', 'train')}",
+        f"公交为空时的步行兜底规则：{walking_policy(state)}",
     ])
     return "\n".join(lines)

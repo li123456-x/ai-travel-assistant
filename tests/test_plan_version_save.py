@@ -4,6 +4,7 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from config.memory import build_memory_record
 
 
 class FakePlan(SimpleNamespace):
@@ -59,7 +60,10 @@ def _load_save_function(db):
         if isinstance(node, ast.FunctionDef) and node.name == "create_plan_with_review"
     )
     namespace = {"get_db": lambda: db, "TravelPlan": FakePlan, "AIReview": FakeReview}
-    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                  and node.name == "_add_plan_memory")
+    namespace.update({"build_memory_record": build_memory_record, "TravelPlanMemory": FakePlan})
+    exec(compile(ast.Module(body=[helper, function], type_ignores=[]), str(path), "exec"), namespace)
     return namespace["create_plan_with_review"]
 
 

@@ -7,7 +7,8 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Text,
-    ForeignKey
+    ForeignKey,
+    JSON,
 )
 from sqlalchemy.orm import relationship
 from config.database import Base
@@ -183,6 +184,10 @@ class TravelPlan(Base):
         "HumanReview",
         back_populates="plan",
         cascade="all, delete-orphan"
+    )
+    memory = relationship(
+        "TravelPlanMemory", back_populates="plan", uselist=False,
+        cascade="all, delete-orphan",
     )
 
 
@@ -417,3 +422,19 @@ class ExecutionStep(Base):
         "AgentRun",
         back_populates="execution_steps"
     )
+
+
+class TravelPlanMemory(Base):
+    __tablename__ = "travel_plan_memories"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plan_id = Column(
+        Integer, ForeignKey("travel_plans.id", ondelete="CASCADE"),
+        nullable=False, unique=True,
+    )
+    request_signature = Column(String(64), nullable=False, index=True)
+    request_payload = Column(JSON, nullable=False)
+    result_snapshot = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+
+    plan = relationship("TravelPlan", back_populates="memory")

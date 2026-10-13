@@ -21,6 +21,7 @@ from langgraph.types import Command
 
 from agents.supervisor import supervisor_node
 from config.revision import build_revision_context, build_revision_update, validate_node_update
+from config.trip_policy import requires_hotel
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -371,7 +372,10 @@ class PlannerRevisionInstructionTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "_build_revision_instruction"
         ]
         self.assertEqual(len(functions), 1)
-        namespace = {"TravelState": dict, "build_revision_context": build_revision_context}
+        namespace = {
+            "TravelState": dict, "build_revision_context": build_revision_context,
+            "requires_hotel": requires_hotel,
+        }
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"), namespace)
 
         state = completed_state()
@@ -509,6 +513,22 @@ class RegenerationWorkflowTests(unittest.TestCase):
         inputs = dict(self.fixture.inputs)
         self.assertEqual(inputs["hotel"]["attraction_names"], result["attraction_names"])
         self.assertEqual(inputs["transport"]["hotel_name"], result["hotel_name"])
+
+    def test_one_day_workflow_skips_hotel_and_still_reaches_human_review(self):
+        state = initial_state()
+        state.update({"days": 1, "return_date": state["departure_date"]})
+        result = self.fixture.invoke(state)
+        self.assertEqual(self.fixture.calls, ["attraction", "transport", "planner", "reviewer"])
+        self.assertEqual(result["hotel_status"], "skipped")
+        self.assertEqual(result["hotel_name"], "")
+        self.assert_paused_for_human(result)
+        self.fixture.clear_calls()
+        changed = self.fixture.resume(
+            approved=False, comment="不要西安城墙", revision_scope="attraction",
+            attraction_excluded_names=["西安城墙"],
+        )
+        self.assertEqual(self.fixture.calls, ["attraction", "transport", "planner", "reviewer"])
+        self.assertEqual(changed["hotel_status"], "skipped")
 
     def test_hotel_change_reuses_attractions_and_updates_transport(self):
         original = self.fixture.generate()
@@ -656,6 +676,7 @@ class RegenerationWorkflowTests(unittest.TestCase):
 
 def _load_app_helpers(graph, thread_id="existing-travel-task"):
     """不导入 app.py，避免执行页面和数据库模块的顶层代码。"""
+    from config.memory import capture_initial_request
     path = PROJECT_ROOT / "app.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     names = {"_resume_graph", "_graph_config", "_split_text", "_build_initial_state"}
@@ -663,6 +684,7 @@ def _load_app_helpers(graph, thread_id="existing-travel-task"):
     namespace = {
         "Command": Command,
         "graph": graph,
+        "capture_initial_request": capture_initial_request,
         "st": SimpleNamespace(session_state=SimpleNamespace(thread_id=thread_id)),
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"), namespace)

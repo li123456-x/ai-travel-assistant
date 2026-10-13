@@ -151,6 +151,7 @@ def _request_route(
             "strategy": 0,
         }
 
+    params["show_fields"] = "cost"
     _wait_for_route_request()
 
     try:

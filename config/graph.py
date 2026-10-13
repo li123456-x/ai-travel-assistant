@@ -15,7 +15,7 @@ from harness.runtime import run_with_harness
 
 def _run_checked_agent(agent_name, agent_func, state):
     def checked_agent(agent_state):
-        return validate_node_update(agent_name, agent_func(agent_state))
+        return validate_node_update(agent_name, agent_func(agent_state), state=agent_state)
 
     return run_with_harness(
         agent_name=agent_name,

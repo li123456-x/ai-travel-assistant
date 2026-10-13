@@ -42,7 +42,7 @@ def search_hotels(city: str, keyword: str = "酒店") -> str:
 
     pois = data.get("pois", [])
     if not pois:
-        return f"没有查询到 {city} 的相关酒店"
+        return "[]"
 
     results = []
     for poi in pois:

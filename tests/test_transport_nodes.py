@@ -3,11 +3,13 @@
 import ast
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 import time
 import unittest
 from unittest.mock import Mock
+from config.trip_policy import requires_hotel, walking_policy
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def load_functions(relative_path, namespace):
     path = PROJECT_ROOT / relative_path
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef))]
     for node in functions:
         node.decorator_list = []
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"), namespace)
@@ -42,6 +44,9 @@ class TransportNodeTests(unittest.TestCase):
         self.steps = Mock()
         self.namespace = load_functions("agents/transport.py", {
             "json": json,
+            "math": math,
+            "requires_hotel": requires_hotel,
+            "walking_policy": walking_policy,
             "time": time,
             "ThreadPoolExecutor": ThreadPoolExecutor,
             "search_intercity_transport": SimpleNamespace(invoke=self.intercity),

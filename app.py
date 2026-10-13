@@ -6,16 +6,17 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from config.graph import builder
+from config.memory import capture_initial_request
 from config.revision import build_revision_update
+from config.trip_policy import requires_hotel
 from database.repository import (
-    complete_travel_session,
-    create_human_review,
-    create_plan_with_review,
     create_travel_session,
     delete_travel_plan,
+    find_reusable_plan,
     get_plan_versions,
     get_travel_sessions,
     mark_plan_final,
+    save_confirmed_plan,
 )
 
 st.set_page_config(
@@ -25,10 +26,10 @@ st.set_page_config(
 )
 
 st.title("✈️ AI 多智能体旅游助手")
-st.caption("基于 LangGraph + 多智能体 + Tool Calling + Human-in-the-loop + PostgreSQL")
+st.caption("基于 LangGraph + 多智能体 + Tool Calling + Human-in-the-loop + MySQL")
 
 
-GRAPH_SCHEMA_VERSION = 2
+GRAPH_SCHEMA_VERSION = 4
 
 if (
     "graph" not in st.session_state
@@ -41,6 +42,8 @@ if (
             "thread_id", "result", "running", "show_feedback", "session_id",
             "current_plan_id", "version", "generation_failed", "pending_plan_save",
             "last_generation_error",
+            "cached_plan",
+            "pending_generation", "confirmation_error",
         ):
             st.session_state.pop(key, None)
         st.info("工作流已更新，请创建新任务。数据库中的历史方案仍然保留。")
@@ -58,8 +61,10 @@ DEFAULT_SESSION_STATE = {
     "current_plan_id": None,
     "version": 0,
     "generation_failed": False,
-    "pending_plan_save": False,
+    "pending_generation": False,
+    "confirmation_error": "",
     "last_generation_error": "",
+    "cached_plan": None,
 }
 
 for key, default_value in DEFAULT_SESSION_STATE.items():
@@ -94,6 +99,14 @@ def _build_initial_state(
     budget,
     preferences_text,
     constraints_text,
+    *,
+    city_transport_mode="transit",
+    intercity_transport_mode="train",
+    allow_walking_fallback=True,
+    max_walking_distance_m=2000.0,
+    max_walking_duration_s=1800.0,
+    max_total_walking_distance_m=4000.0,
+    max_total_walking_duration_s=3600.0,
 ):
     preferences = _split_text(preferences_text)
     constraints = _split_text(constraints_text)
@@ -110,17 +123,18 @@ def _build_initial_state(
         f"要求{constraints_text}"
     )
 
-    return {
+    state = {
         "session_id": None,
         "thread_id": st.session_state.thread_id,
         "trigger_reason": "initial",
         "agent_run_id": None,
         "user_request": user_request,
-        "origin": origin,
-        "destination": destination,
+        "origin": origin.strip(),
+        "destination": destination.strip(),
         "departure_date": departure_date.strftime("%Y-%m-%d"),
         "return_date": return_date.strftime("%Y-%m-%d"),
         "days": int(days),
+        "needs_hotel": int(days) > 1,
         "people": int(people),
         "budget": float(budget),
         "preferences": preferences,
@@ -130,6 +144,7 @@ def _build_initial_state(
         "hotel_result": "",
         "hotel_name": "",
         "transport_result": "",
+        "transport_segments": [],
         "planner_result": "",
         "review_result": "",
         "review_passed": False,
@@ -137,12 +152,13 @@ def _build_initial_state(
         "max_review_retries": 2,
         "human_review_result": "",
         "human_review_passed": False,
+        "human_feedback_history": [],
         "human_revision_count": 0,
         "max_human_revisions": 3,
         "next_agent": "",
 
         "attraction_status": "pending",
-        "hotel_status": "pending",
+        "hotel_status": "pending" if int(days) > 1 else "skipped",
         "transport_status": "pending",
 
         "attraction_revision_request": "",
@@ -153,21 +169,29 @@ def _build_initial_state(
         "attraction_excluded_names": [],
         "hotel_search_keyword": "酒店",
         "hotel_excluded_names": [],
-        "city_transport_mode": "transit",
-        "intercity_transport_mode": "train",
+        "city_transport_mode": city_transport_mode,
+        "intercity_transport_mode": intercity_transport_mode,
+        "allow_walking_fallback": allow_walking_fallback,
+        "max_walking_distance_m": float(max_walking_distance_m),
+        "max_walking_duration_s": float(max_walking_duration_s),
+        "max_total_walking_distance_m": float(max_total_walking_distance_m),
+        "max_total_walking_duration_s": float(max_total_walking_duration_s),
 
     }
+    state["initial_request_state"] = capture_initial_request(state)
+    return state
 
 
-def _save_plan_and_review(result):
-    next_version = st.session_state.version + 1
-    plan_id = create_plan_with_review(
-        session_id=st.session_state.session_id,
-        state=result,
-        version=next_version,
-    )
-    st.session_state.version = next_version
-    st.session_state.current_plan_id = plan_id
+def _stage_candidate(result):
+    if not isinstance(result, dict) or not result.get("__interrupt__"):
+        raise ValueError("任务未到达人工审核，不能展示为待确认方案")
+    st.session_state.result = result
+    st.session_state.running = True
+    st.session_state.show_feedback = False
+    st.session_state.pending_generation = False
+    st.session_state.generation_failed = False
+    st.session_state.last_generation_error = ""
+    st.session_state.confirmation_error = ""
 
 
 def _resume_graph(
@@ -178,6 +202,11 @@ def _resume_graph(
     attraction_excluded_names: list[str] | None = None,
     city_transport_mode: str | None = None,
     intercity_transport_mode: str | None = None,
+    allow_walking_fallback: bool | None = None,
+    max_walking_distance_m: float | None = None,
+    max_walking_duration_s: float | None = None,
+    max_total_walking_distance_m: float | None = None,
+    max_total_walking_duration_s: float | None = None,
 ):
     resume_data = {
         "approved": approved,
@@ -192,6 +221,15 @@ def _resume_graph(
         resume_data["city_transport_mode"] = city_transport_mode
     if intercity_transport_mode is not None:
         resume_data["intercity_transport_mode"] = intercity_transport_mode
+    for key, value in (
+        ("allow_walking_fallback", allow_walking_fallback),
+        ("max_walking_distance_m", max_walking_distance_m),
+        ("max_walking_duration_s", max_walking_duration_s),
+        ("max_total_walking_distance_m", max_total_walking_distance_m),
+        ("max_total_walking_duration_s", max_total_walking_duration_s),
+    ):
+        if value is not None:
+            resume_data[key] = value
 
     return graph.invoke(
         Command(resume=resume_data),
@@ -228,6 +266,35 @@ with st.sidebar:
     )
     preferences_text = st.text_input("旅游偏好", value="历史文化")
     constraints_text = st.text_input("其他要求", value="不要太累")
+    with st.expander("交通设置", expanded=False):
+        initial_city_options = {"公共交通优先": "transit", "自驾": "driving", "步行": "walking"}
+        initial_city_label = st.selectbox(
+            "初始市内交通方式", list(initial_city_options), key="initial_city_mode",
+        )
+        initial_intercity_options = {"高铁 / 火车": "train", "飞机": "flight"}
+        initial_intercity_label = st.selectbox(
+            "初始城际交通方式", list(initial_intercity_options), key="initial_intercity_mode",
+        )
+        allow_walking_fallback = st.checkbox(
+            "公交无方案时允许短距离步行", value=True, key="initial_allow_walking",
+        )
+        max_walking_km = st.number_input(
+            "单段步行兜底上限（公里）", min_value=0.1, max_value=20.0,
+            value=2.0, step=0.1, key="initial_walking_km",
+        )
+        max_walking_minutes = st.number_input(
+            "单段步行兜底上限（分钟）", min_value=1, max_value=240,
+            value=30, key="initial_walking_minutes",
+        )
+        max_total_walking_km = st.number_input(
+            "累计步行兜底上限（公里）", min_value=0.1, max_value=40.0,
+            value=4.0, step=0.1, key="initial_total_walking_km",
+        )
+        max_total_walking_minutes = st.number_input(
+            "累计步行兜底上限（分钟）", min_value=1, max_value=480,
+            value=60, key="initial_total_walking_minutes",
+        )
+    force_refresh = st.checkbox("重新查询，不复用历史方案", value=False, key="force_refresh")
     generate_button = st.button("🚀 生成旅游方案", use_container_width=True)
 
     st.divider()
@@ -320,6 +387,9 @@ with st.sidebar:
                             raise ValueError("该方案已不存在，请刷新历史列表")
                         if is_current_history:
                             st.session_state.current_plan_id = item["plan_id"]
+                        cached = st.session_state.get("cached_plan")
+                        if cached and cached["session_id"] == history_session_id:
+                            st.session_state.cached_plan = None
                         st.success("已设为最终版")
                         st.rerun()
                     except Exception as e:
@@ -331,6 +401,9 @@ with st.sidebar:
                             raise ValueError("该方案已不存在，请刷新历史列表")
                         if is_current_history and st.session_state.current_plan_id == item["plan_id"]:
                             st.session_state.current_plan_id = None
+                        cached = st.session_state.get("cached_plan")
+                        if cached and cached["plan_id"] == item["plan_id"]:
+                            st.session_state.cached_plan = None
                         st.success("已删除该版本")
                         st.rerun()
                     except Exception as e:
@@ -353,8 +426,10 @@ if generate_button:
     st.session_state.current_plan_id = None
     st.session_state.version = 0
     st.session_state.generation_failed = False
-    st.session_state.pending_plan_save = False
+    st.session_state.pending_generation = False
+    st.session_state.confirmation_error = ""
     st.session_state.last_generation_error = ""
+    st.session_state.cached_plan = None
 
     days = (return_date - departure_date).days + 1
     initial_state = _build_initial_state(
@@ -367,7 +442,23 @@ if generate_button:
         budget=budget,
         preferences_text=preferences_text,
         constraints_text=constraints_text,
+        city_transport_mode=initial_city_options[initial_city_label],
+        intercity_transport_mode=initial_intercity_options[initial_intercity_label],
+        allow_walking_fallback=allow_walking_fallback,
+        max_walking_distance_m=max_walking_km * 1000,
+        max_walking_duration_s=max_walking_minutes * 60,
+        max_total_walking_distance_m=max_total_walking_km * 1000,
+        max_total_walking_duration_s=max_total_walking_minutes * 60,
     )
+
+    try:
+        cached_plan = None if force_refresh else find_reusable_plan(initial_state)
+    except Exception as e:
+        st.error(f"读取长期记忆失败：{e}")
+        st.stop()
+    if cached_plan is not None:
+        st.session_state.cached_plan = cached_plan
+        st.rerun()
 
     try:
         session_id = create_travel_session(
@@ -381,25 +472,16 @@ if generate_button:
         st.stop()
 
     try:
-        st.session_state.pending_plan_save = True
+        st.session_state.pending_generation = True
         with st.spinner("多智能体正在规划旅游方案..."):
             result = graph.invoke(initial_state, config=_graph_config())
+        _stage_candidate(result)
     except Exception as e:
         st.session_state.generation_failed = True
         st.session_state.last_generation_error = f"LangGraph 执行失败：{e}"
 
     if not st.session_state.generation_failed:
-        try:
-            _save_plan_and_review(result)
-        except Exception as e:
-            st.session_state.generation_failed = True
-            st.session_state.last_generation_error = f"保存旅游方案失败：{e}"
-        else:
-            st.session_state.pending_plan_save = False
-            st.session_state.result = result
-            st.session_state.running = True
-            st.session_state.show_feedback = False
-            st.rerun()
+        st.rerun()
 
 
 if st.session_state.generation_failed:
@@ -410,16 +492,7 @@ if st.session_state.generation_failed:
         try:
             with st.spinner("正在继续当前任务..."):
                 recovered = graph.invoke(None, config=_graph_config())
-            if not recovered.get("__interrupt__"):
-                raise ValueError("任务未到达人工审核，不能保存为新方案")
-            if st.session_state.pending_plan_save:
-                _save_plan_and_review(recovered)
-            st.session_state.pending_plan_save = False
-            st.session_state.generation_failed = False
-            st.session_state.last_generation_error = ""
-            st.session_state.result = recovered
-            st.session_state.running = True
-            st.session_state.show_feedback = False
+            _stage_candidate(recovered)
             st.rerun()
         except Exception as e:
             st.session_state.last_generation_error = f"重试失败：{e}"
@@ -430,7 +503,7 @@ if st.session_state.generation_failed:
         key="cancel_failed_regeneration",
     ):
         try:
-            # The cached result is the last successfully saved, interrupted plan.
+            # Restore the previous in-memory candidate, not a persisted draft.
             # Restore that checkpoint, not the failed/dirty specialist outputs.
             graph.update_state(
                 _graph_config(),
@@ -442,7 +515,7 @@ if st.session_state.generation_failed:
                 raise ValueError("未能恢复到上一版人工审核位置")
             st.session_state.result = restored
             st.session_state.generation_failed = False
-            st.session_state.pending_plan_save = False
+            st.session_state.pending_generation = False
             st.session_state.last_generation_error = ""
             st.session_state.running = True
             st.session_state.show_feedback = False
@@ -450,6 +523,30 @@ if st.session_state.generation_failed:
         except Exception as e:
             st.error(f"返回上一版失败：{e}")
 
+
+cached_plan = st.session_state.cached_plan
+if cached_plan:
+    saved = cached_plan["result"]
+    st.subheader("历史方案复用")
+    st.caption(
+        f"来源任务 {cached_plan['session_id']}，Version {cached_plan['version']}，"
+        f"保存时间：{cached_plan['created_at']}"
+    )
+    st.warning("这是已确认的历史方案快照，本次没有重新查询实时路线、班次或票价。")
+    with st.expander("景点", expanded=False):
+        st.markdown(saved["attractions_result"])
+    if saved.get("needs_hotel", True):
+        with st.expander("酒店", expanded=False):
+            st.markdown(saved["hotel_result"])
+    with st.expander("交通", expanded=False):
+        st.markdown(saved["transport_result"])
+        if saved.get("transport_segments"):
+            st.dataframe(saved["transport_segments"], hide_index=True, use_container_width=True)
+    st.markdown(saved["planner_result"])
+    if saved.get("human_feedback_history"):
+        with st.expander("已采纳的修改意见", expanded=False):
+            for feedback in saved["human_feedback_history"]:
+                st.markdown(feedback["comment"])
 
 result = st.session_state.result
 
@@ -460,13 +557,16 @@ if result:
     with st.expander("🏛️ Attraction Agent", expanded=False):
         st.markdown(result.get("attractions_result", "暂无结果"))
 
-    with st.expander("🏨 Hotel Agent", expanded=False):
-        st.markdown(result.get("hotel_result", "暂无结果"))
+    if requires_hotel(result):
+        with st.expander("🏨 Hotel Agent", expanded=False):
+            st.markdown(result.get("hotel_result", "暂无结果"))
 
     with st.expander("🚇 Transport Agent", expanded=False):
         st.markdown(result.get("transport_result", "暂无结果"))
+        if result.get("transport_segments"):
+            st.dataframe(result["transport_segments"], hide_index=True, use_container_width=True)
 
-    st.subheader("📅 最终旅游方案")
+    st.subheader("📅 待确认旅游方案" if st.session_state.running else "📅 最终旅游方案")
     st.markdown(result.get("planner_result", ""))
 
     st.subheader("🔍 AI Reviewer")
@@ -494,7 +594,7 @@ if result:
 
         with col1:
             approve_button = st.button(
-                "✅ 同意方案",
+                "重试保存最终方案" if result.get("human_review_passed") else "✅ 同意方案",
                 use_container_width=True,
                 key="approve_plan",
             )
@@ -504,23 +604,31 @@ if result:
                 "❌ 修改方案",
                 use_container_width=True,
                 key="reject_plan",
+                disabled=result.get("human_review_passed", False),
             )
+
+        if st.session_state.confirmation_error:
+            st.error(st.session_state.confirmation_error)
+            if result.get("human_review_passed"):
+                st.warning("人工确认已完成但最终方案尚未保存，重试保存不会再次生成方案。")
+            else:
+                st.warning("人工确认尚未完成，请重试确认。")
 
         if approve_button:
             comment = "人工审核通过"
 
             try:
-                create_human_review(
-                    plan_id=st.session_state.current_plan_id,
-                    approved=True,
-                    comment=comment,
+                if not result.get("human_review_passed"):
+                    with st.spinner("正在确认最终旅游方案..."):
+                        result = _resume_graph(approved=True, comment=comment)
+                    st.session_state.result = result
+                    st.session_state.show_feedback = False
+                saved = save_confirmed_plan(
+                    session_id=st.session_state.session_id, state=result, comment=comment,
                 )
-
-                with st.spinner("正在确认最终旅游方案..."):
-                    result = _resume_graph(approved=True, comment=comment)
-
-                mark_plan_final(st.session_state.current_plan_id)
-                complete_travel_session(st.session_state.session_id)
+                st.session_state.current_plan_id = saved["plan_id"]
+                st.session_state.version = saved["version"]
+                st.session_state.confirmation_error = ""
 
                 st.session_state.result = result
                 st.session_state.running = False
@@ -528,7 +636,8 @@ if result:
                 st.rerun()
 
             except Exception as e:
-                st.error(f"确认方案失败：{e}")
+                st.session_state.confirmation_error = f"确认或保存最终方案失败：{e}"
+                st.rerun()
 
         if reject_button:
             st.session_state.show_feedback = True
@@ -541,9 +650,10 @@ if result:
             revision_options = {
                 "仅调整行程": "planner",
                 "更换景点": "attraction",
-                "更换酒店": "hotel",
                 "更换交通方式": "transport",
             }
+            if requires_hotel(result):
+                revision_options["更换酒店"] = "hotel"
             revision_key = (
                 f"{st.session_state.thread_id}_"
                 f"{result.get('human_revision_count', 0)}"
@@ -602,6 +712,21 @@ if result:
                     "city_transport_mode": city_options[city_label],
                     "intercity_transport_mode": intercity_options[intercity_label],
                 })
+                revision_parameters["allow_walking_fallback"] = st.checkbox(
+                    "修改后允许步行兜底", value=result.get("allow_walking_fallback", True),
+                    key=f"allow_walking_{revision_key}",
+                )
+                for field, label, divisor, default in (
+                    ("max_walking_distance_m", "修改后单段步行上限（公里）", 1000, 2000),
+                    ("max_walking_duration_s", "修改后单段步行上限（分钟）", 60, 1800),
+                    ("max_total_walking_distance_m", "修改后累计步行上限（公里）", 1000, 4000),
+                    ("max_total_walking_duration_s", "修改后累计步行上限（分钟）", 60, 3600),
+                ):
+                    revision_parameters[field] = st.number_input(
+                        label, min_value=0.1,
+                        value=float(result.get(field, default)) / divisor,
+                        step=0.1, key=f"{field}_{revision_key}",
+                    ) * divisor
             else:
                 st.caption("只调整行程节奏或说明。要换景点、酒店或交通，请选择对应类型。")
 
@@ -633,27 +758,14 @@ if result:
                     try:
                         # Validate before writing the audit record or resuming the graph.
                         build_revision_update(result, decision)
-                        create_human_review(
-                            plan_id=st.session_state.current_plan_id,
-                            approved=False,
-                            comment=decision["comment"],
-                        )
-
-                        st.session_state.pending_plan_save = True
+                        st.session_state.pending_generation = True
                         with st.spinner("正在按修改类型更新旅游方案..."):
                             result = _resume_graph(**decision)
-
-                        _save_plan_and_review(result)
-
-                        st.session_state.result = result
-                        st.session_state.pending_plan_save = False
-                        st.session_state.generation_failed = False
-                        st.session_state.last_generation_error = ""
-                        st.session_state.show_feedback = False
+                        _stage_candidate(result)
                         st.rerun()
 
                     except Exception as e:
-                        if st.session_state.pending_plan_save:
+                        if st.session_state.pending_generation:
                             st.session_state.generation_failed = True
                             st.session_state.last_generation_error = f"重新生成方案失败：{e}"
                         st.error(f"重新生成方案失败：{e}")

@@ -1,7 +1,7 @@
 import os
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
+from sqlalchemy import URL, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 
@@ -21,12 +21,15 @@ DB_NAME = _required_env("DB_NAME")
 DB_USER = _required_env("DB_USER")
 DB_PASSWORD = _required_env("DB_PASSWORD")
 
-DATABASE_URL = (
-    f"postgresql+psycopg2://"
-    f"{DB_USER}:{DB_PASSWORD}"
-    f"@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+DATABASE_URL = URL.create(
+    drivername="mysql+pymysql",
+    username=DB_USER,
+    password=DB_PASSWORD,
+    host=DB_HOST,
+    port=int(DB_PORT),
+    database=DB_NAME,
+    query={"charset": "utf8mb4"},
 )
-
 engine = create_engine(
     DATABASE_URL,
     echo=False,
